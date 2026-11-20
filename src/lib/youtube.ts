@@ -1,13 +1,11 @@
-import { google } from 'googleapis';
-import fs from 'fs';
-import { Readable } from 'stream';
+import fs from 'fs/promises';
 import {
   deleteVideoFile,
   getLocalVideoFilePath,
   readDatabaseState,
   writeDatabaseState,
 } from './storage';
-import { ShortQueueItem, VideoPrivacy } from './types';
+import { AppDatabaseState, ShortQueueItem, VideoPrivacy } from './types';
 
 export const YOUTUBE_SCOPES = [
   'https://www.googleapis.com/auth/youtube.upload',
@@ -50,43 +48,106 @@ export function isAllowedRedirectUri(candidate: string): boolean {
   }
 }
 
-export function createOAuth2Client(redirectUri: string) {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+function getClientCredentials() {
+  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
   if (!clientId || !clientSecret) {
-    throw new Error('Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET environment variables');
+    throw new Error(
+      'Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET environment variables'
+    );
   }
-  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  return { clientId, clientSecret };
 }
 
-export function buildGoogleAuthUrl(redirectUri: string, statePayload: string): string {
-  const oauth2Client = createOAuth2Client(redirectUri);
-  return oauth2Client.generateAuthUrl({
+export function buildGoogleAuthUrl(
+  redirectUri: string,
+  statePayload: string
+): string {
+  const { clientId } = getClientCredentials();
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: YOUTUBE_SCOPES.join(' '),
     access_type: 'offline',
     prompt: 'consent',
-    scope: YOUTUBE_SCOPES,
     state: statePayload,
   });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
 
-export async function exchangeCodeForYouTubeAuth(code: string, redirectUri: string) {
-  const oauth2Client = createOAuth2Client(redirectUri);
-  const { tokens } = await oauth2Client.getToken(code);
-  oauth2Client.setCredentials(tokens);
+interface GoogleTokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  scope?: string;
+  token_type?: string;
+  error?: string;
+  error_description?: string;
+}
 
-  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-  const channelRes = await youtube.channels.list({
-    part: ['snippet'],
-    mine: true,
+export async function exchangeCodeForYouTubeAuth(
+  code: string,
+  redirectUri: string
+) {
+  const { clientId, clientSecret } = getClientCredentials();
+
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+    }),
   });
 
-  const channel = channelRes.data.items?.[0];
-  const channelId = channel?.id || undefined;
-  const channelTitle = channel?.snippet?.title || 'YouTube Channel';
-  const channelThumbnail =
-    channel?.snippet?.thumbnails?.default?.url ||
-    channel?.snippet?.thumbnails?.medium?.url ||
-    undefined;
+  const tokenData = (await tokenRes.json()) as GoogleTokenResponse;
+  if (!tokenRes.ok || !tokenData.access_token) {
+    throw new Error(
+      tokenData.error_description ||
+        tokenData.error ||
+        'Failed to exchange authorization code'
+    );
+  }
+
+  const channelRes = await fetch(
+    'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true',
+    {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    }
+  );
+
+  let channelId: string | undefined;
+  let channelTitle = 'YouTube Channel';
+  let channelThumbnail: string | undefined;
+
+  if (channelRes.ok) {
+    const channelData = (await channelRes.json()) as {
+      items?: Array<{
+        id?: string;
+        snippet?: {
+          title?: string;
+          thumbnails?: {
+            default?: { url?: string };
+            medium?: { url?: string };
+          };
+        };
+      }>;
+    };
+    const channel = channelData.items?.[0];
+    channelId = channel?.id;
+    channelTitle = channel?.snippet?.title || channelTitle;
+    channelThumbnail =
+      channel?.snippet?.thumbnails?.default?.url ||
+      channel?.snippet?.thumbnails?.medium?.url;
+  }
+
+  const expiryDate = tokenData.expires_in
+    ? Date.now() + tokenData.expires_in * 1000
+    : undefined;
 
   const dbState = await readDatabaseState();
   dbState.auth = {
@@ -96,11 +157,12 @@ export async function exchangeCodeForYouTubeAuth(code: string, redirectUri: stri
     channelThumbnail,
     connectedAt: new Date().toISOString(),
     tokens: {
-      access_token: tokens.access_token || '',
-      refresh_token: tokens.refresh_token || dbState.auth.tokens?.refresh_token,
-      expiry_date: tokens.expiry_date || undefined,
-      scope: tokens.scope || undefined,
-      token_type: tokens.token_type || undefined,
+      access_token: tokenData.access_token,
+      refresh_token:
+        tokenData.refresh_token || dbState.auth.tokens?.refresh_token,
+      expiry_date: expiryDate,
+      scope: tokenData.scope,
+      token_type: tokenData.token_type,
     },
   };
   await writeDatabaseState(dbState);
@@ -112,18 +174,72 @@ export async function exchangeCodeForYouTubeAuth(code: string, redirectUri: stri
   };
 }
 
-async function getVideoReadableStream(item: ShortQueueItem): Promise<Readable> {
+async function getValidAccessToken(dbState: AppDatabaseState): Promise<string> {
+  const tokens = dbState.auth.tokens;
+  if (!tokens?.access_token && !tokens?.refresh_token) {
+    throw new Error('YouTube OAuth tokens are missing. Please reconnect.');
+  }
+
+  const needsRefresh =
+    !tokens.access_token ||
+    (tokens.expiry_date !== undefined && Date.now() > tokens.expiry_date - 60_000);
+
+  if (!needsRefresh && tokens.access_token) {
+    return tokens.access_token;
+  }
+
+  if (!tokens.refresh_token) {
+    if (tokens.access_token) return tokens.access_token;
+    throw new Error('OAuth refresh token missing. Please reconnect YouTube.');
+  }
+
+  const { clientId, clientSecret } = getClientCredentials();
+  const refreshRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: tokens.refresh_token,
+      grant_type: 'refresh_token',
+    }),
+  });
+
+  const refreshData = (await refreshRes.json()) as GoogleTokenResponse;
+  if (!refreshRes.ok || !refreshData.access_token) {
+    throw new Error(
+      refreshData.error_description ||
+        refreshData.error ||
+        'Failed to refresh YouTube access token'
+    );
+  }
+
+  dbState.auth.tokens = {
+    ...tokens,
+    access_token: refreshData.access_token,
+    expiry_date: refreshData.expires_in
+      ? Date.now() + refreshData.expires_in * 1000
+      : undefined,
+  };
+  await writeDatabaseState(dbState);
+
+  return refreshData.access_token;
+}
+
+async function loadVideoBuffer(item: ShortQueueItem): Promise<Buffer> {
   if (item.storageType === 'local' && item.blobPathname) {
     const filePath = getLocalVideoFilePath(item.blobPathname);
-    return fs.createReadStream(filePath);
+    return fs.readFile(filePath);
   }
 
   const response = await fetch(item.blobUrl);
-  if (!response.ok || !response.body) {
-    throw new Error(`Failed to download video from Blob storage (${response.status})`);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to download video from Blob storage (${response.status})`
+    );
   }
-  // Convert Web ReadableStream to Node.js Readable
-  return Readable.fromWeb(response.body as unknown as import('stream/web').ReadableStream);
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 export async function uploadShortToYouTube(
@@ -133,36 +249,18 @@ export async function uploadShortToYouTube(
 ): Promise<{ youtubeVideoId: string; youtubeUrl: string }> {
   const dbState = await readDatabaseState();
   if (!dbState.auth.connected || !dbState.auth.tokens) {
-    throw new Error('YouTube account is not connected. Please authorize with Google/YouTube first.');
+    throw new Error(
+      'YouTube account is not connected. Please authorize with Google/YouTube first.'
+    );
   }
 
-  const redirectUri = `${getEffectiveBaseUrl()}/api/auth/callback`;
-  const oauth2Client = createOAuth2Client(redirectUri);
-  oauth2Client.setCredentials(dbState.auth.tokens);
-
-  // Persist refreshed tokens automatically if Google issues a new access token
-  oauth2Client.on('tokens', async (newTokens) => {
-    try {
-      const latest = await readDatabaseState();
-      if (latest.auth.tokens) {
-        latest.auth.tokens = {
-          ...latest.auth.tokens,
-          access_token: newTokens.access_token || latest.auth.tokens.access_token,
-          refresh_token: newTokens.refresh_token || latest.auth.tokens.refresh_token,
-          expiry_date: newTokens.expiry_date || latest.auth.tokens.expiry_date,
-        };
-        await writeDatabaseState(latest);
-      }
-    } catch (err) {
-      console.error('Failed to persist refreshed OAuth tokens:', err);
-    }
-  });
-
-  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-  const mediaStream = await getVideoReadableStream(item);
+  const accessToken = await getValidAccessToken(dbState);
+  const videoBuffer = await loadVideoBuffer(item);
+  const mimeType = item.mimeType || 'video/mp4';
 
   const rawDesc = (item.description || '').trim();
-  const hasShortsTag = /#shorts\b/i.test(item.title) || /#shorts\b/i.test(rawDesc);
+  const hasShortsTag =
+    /#shorts\b/i.test(item.title) || /#shorts\b/i.test(rawDesc);
   const finalDescription = hasShortsTag
     ? rawDesc
     : rawDesc
@@ -170,30 +268,66 @@ export async function uploadShortToYouTube(
     : '#Shorts';
 
   const finalTags = Array.from(
-    new Set([...(item.tags || []), 'Shorts'].map((t) => t.trim()).filter(Boolean))
+    new Set(
+      [...(item.tags || []), 'Shorts'].map((t) => t.trim()).filter(Boolean)
+    )
   );
 
-  const response = await youtube.videos.insert({
-    part: ['snippet', 'status'],
-    requestBody: {
-      snippet: {
-        title: item.title.slice(0, 100),
-        description: finalDescription.slice(0, 5000),
-        tags: finalTags.slice(0, 30),
-        categoryId: '22', // People & Blogs
+  // Step 1: Initiate YouTube Data API v3 Resumable Upload session
+  const initRes = await fetch(
+    'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Length': String(videoBuffer.byteLength),
+        'X-Upload-Content-Type': mimeType,
       },
-      status: {
-        privacyStatus: item.privacyStatus || fallbackPrivacy || 'public',
-        selfDeclaredMadeForKids: false,
-      },
+      body: JSON.stringify({
+        snippet: {
+          title: item.title.slice(0, 100),
+          description: finalDescription.slice(0, 5000),
+          tags: finalTags.slice(0, 30),
+          categoryId: '22',
+        },
+        status: {
+          privacyStatus: item.privacyStatus || fallbackPrivacy || 'public',
+          selfDeclaredMadeForKids: false,
+        },
+      }),
+    }
+  );
+
+  if (!initRes.ok) {
+    const errText = await initRes.text();
+    throw new Error(`YouTube upload init failed (${initRes.status}): ${errText}`);
+  }
+
+  const uploadUrl = initRes.headers.get('location');
+  if (!uploadUrl) {
+    throw new Error('YouTube API did not return resumable upload location.');
+  }
+
+  // Step 2: Upload the video binary payload
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Content-Length': String(videoBuffer.byteLength),
+      'Content-Type': mimeType,
     },
-    media: {
-      mimeType: item.mimeType || 'video/mp4',
-      body: mediaStream,
-    },
+    body: new Uint8Array(videoBuffer),
   });
 
-  const youtubeVideoId = response.data.id;
+  if (!uploadRes.ok) {
+    const errText = await uploadRes.text();
+    throw new Error(
+      `YouTube video upload failed (${uploadRes.status}): ${errText}`
+    );
+  }
+
+  const uploadedData = (await uploadRes.json()) as { id?: string };
+  const youtubeVideoId = uploadedData.id;
   if (!youtubeVideoId) {
     throw new Error('YouTube API did not return a video ID.');
   }
