@@ -1,0 +1,6 @@
+{
+  "name": "ShortsFlow",
+  "description": "YouTube Shorts auto-scheduler with multi-video queue ordering, Vercel Blob storage, OAuth2 YouTube publishing, daily cron automation, and Bengali & English UI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
